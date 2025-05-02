@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 import re
 import openpyxl
+from functools import lru_cache
+from collections import defaultdict
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///grid.db'
@@ -135,19 +137,54 @@ with app.app_context():
     db.create_all()
     initialize_database_from_excel()
 
+# Cache for column orders
+@lru_cache(maxsize=32)
+def get_column_order(sheet):
+    return ColumnOrder.query.filter_by(sheet=sheet).order_by(ColumnOrder.order_index).all()
+
+# Cache for lookup arrays
+@lru_cache(maxsize=32)
+def get_lookup_array(sheet, column):
+    """Get all values from a column in a sheet, cached"""
+    cells = Cell.query.filter_by(sheet=sheet, excel_col=column).order_by(Cell.excel_row).all()
+    return [(cell.excel_row, cell.value) for cell in cells]
+
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/cells/<string:sheet>', methods=['GET'])
 def get_cells(sheet):
-    cells = Cell.query.filter_by(sheet=sheet).all()
-    column_orders = ColumnOrder.query.filter_by(sheet=sheet).order_by(ColumnOrder.order_index).all()
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 100, type=int)
+    
+    # Get total count of rows
+    total_rows = db.session.query(db.func.count(db.distinct(Cell.row))).filter_by(sheet=sheet).scalar()
+    total_pages = (total_rows + per_page - 1) // per_page
+    
+    # Get unique row numbers for the current page
+    row_numbers = db.session.query(Cell.row).filter_by(sheet=sheet).distinct().order_by(Cell.row).offset((page - 1) * per_page).limit(per_page).all()
+    row_numbers = [row[0] for row in row_numbers]
+    
+    # Get column order from cache
+    column_orders = get_column_order(sheet)
     ordered_columns = [co.column_name for co in column_orders]
+    
+    # Get only cells for these rows and columns
+    cells = Cell.query.filter_by(sheet=sheet).filter(
+        Cell.row.in_(row_numbers),
+        Cell.column.in_(ordered_columns)
+    ).all()
     
     return jsonify({
         'cells': [cell.to_dict() for cell in cells],
-        'columnOrder': ordered_columns
+        'columnOrder': ordered_columns,
+        'pagination': {
+            'current_page': page,
+            'total_pages': total_pages,
+            'total_rows': total_rows,
+            'per_page': per_page
+        }
     })
 
 @app.route('/api/cells/<string:sheet>/<int:row>/<string:column>', methods=['PUT'])
@@ -218,10 +255,7 @@ def evaluate_formula(formula, sheet_name):
         if '_xlfn.XLOOKUP' in formula:
             print("Detected XLOOKUP formula")
             # Extract parameters from XLOOKUP formula
-            # Format: _xlfn.XLOOKUP(lookup_value, lookup_array, return_array)
-            # Remove the function name and parentheses
             params_str = formula.replace('_xlfn.XLOOKUP', '').strip('()')
-            # Split by comma, but be careful with commas inside parentheses
             params = []
             current_param = ""
             paren_count = 0
@@ -258,7 +292,7 @@ def evaluate_formula(formula, sheet_name):
             # Get the value to look up
             lookup_cell = Cell.query.filter_by(
                 excel_coord=lookup_coord,
-                sheet=sheet_name  # Look in current sheet for lookup value
+                sheet=sheet_name
             ).first()
             
             if not lookup_cell:
@@ -268,18 +302,15 @@ def evaluate_formula(formula, sheet_name):
             lookup_value = lookup_cell.value
             print(f"Value to look up: {lookup_value}")
             
-            # Get all cells from lookup array (inputs sheet)
+            # Get lookup and return arrays from cache
             lookup_sheet = lookup_array.split('!')[0]
             lookup_col = lookup_array.split('!')[1].split(':')[0]
-            lookup_cells = Cell.query.filter_by(
-                sheet=lookup_sheet,
-                excel_col=lookup_col
-            ).order_by(Cell.excel_row).all()
+            lookup_cells = get_lookup_array(lookup_sheet, lookup_col)
             
             # Find the matching value in lookup array
             match_index = -1
-            for i, cell in enumerate(lookup_cells):
-                if cell.value == lookup_value:
+            for i, (row, value) in enumerate(lookup_cells):
+                if value == lookup_value:
                     match_index = i
                     break
             
@@ -287,19 +318,16 @@ def evaluate_formula(formula, sheet_name):
                 print(f"No match found for value: {lookup_value}")
                 return "No match found"
             
-            # Get the corresponding value from return array
+            # Get return array from cache
             return_sheet = return_array.split('!')[0]
             return_col = return_array.split('!')[1].split(':')[0]
-            return_cells = Cell.query.filter_by(
-                sheet=return_sheet,
-                excel_col=return_col
-            ).order_by(Cell.excel_row).all()
+            return_cells = get_lookup_array(return_sheet, return_col)
             
             if match_index >= len(return_cells):
                 print(f"Return array index out of bounds: {match_index}")
                 return "Index out of bounds"
             
-            result = return_cells[match_index].value
+            result = return_cells[match_index][1]  # Get value from (row, value) tuple
             print(f"Found matching value: {result}")
             return result
         
@@ -307,7 +335,6 @@ def evaluate_formula(formula, sheet_name):
         elif formula.startswith('SUM('):
             print("Detected SUM formula")
             # Extract range from SUM formula
-            # Format: SUM(sheet!range)
             range_str = formula[4:].strip('()')
             print(f"SUM range: {range_str}")
             
@@ -319,15 +346,21 @@ def evaluate_formula(formula, sheet_name):
             start_cell, end_cell = range_cells.split(':')
             print(f"Start cell: {start_cell}, End cell: {end_cell}")
             
-            # Get all cells in the range
-            cells = Cell.query.filter_by(sheet=sheet).all()
+            # Extract column and row numbers
+            start_col = ''.join(filter(str.isalpha, start_cell))
+            start_row = int(''.join(filter(str.isdigit, start_cell)))
+            end_col = ''.join(filter(str.isalpha, end_cell))
+            end_row = int(''.join(filter(str.isdigit, end_cell)))
+            
+            # Get all cells in the range from cache
+            cells = get_lookup_array(sheet, start_col)
             sum_value = 0
             
-            for cell in cells:
-                if cell.excel_coord >= start_cell and cell.excel_coord <= end_cell:
+            for row, value in cells:
+                row_num = int(row)
+                if start_row <= row_num <= end_row:
                     try:
-                        value = float(cell.value)
-                        sum_value += value
+                        sum_value += float(value)
                     except (ValueError, TypeError):
                         continue
             
@@ -337,9 +370,35 @@ def evaluate_formula(formula, sheet_name):
         # Handle regular formulas
         try:
             print("Evaluating regular formula")
-            # Replace cell references with their values
-            # This is a simple implementation and might need to be enhanced
-            # for more complex formulas
+            
+            # Handle concatenation formulas (e.g., =A2&B2)
+            if '&' in formula:
+                print("Detected concatenation formula")
+                # Split by & and get cell references
+                cell_refs = formula.split('&')
+                result = ""
+                
+                for ref in cell_refs:
+                    # Extract column and row from reference (e.g., A2)
+                    col = ''.join(filter(str.isalpha, ref))
+                    row = int(''.join(filter(str.isdigit, ref)))
+                    
+                    # Get the cell value
+                    cell = Cell.query.filter_by(
+                        sheet=sheet_name,
+                        excel_col=col,
+                        excel_row=str(row)
+                    ).first()
+                    
+                    if cell and cell.value:
+                        result += str(cell.value)
+                    else:
+                        result += ""
+                
+                print(f"Concatenation result: {result}")
+                return result
+            
+            # Handle other regular formulas
             result = eval(formula)
             print(f"Formula result: {result}")
             return str(result)
