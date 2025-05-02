@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grid Table</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: center;
+            min-width: 100px;
+        }
+        th {
+            background-color: #f2f2f2;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        input {
+            width: 100%;
+            text-align: center;
+            border: none;
+            background: transparent;
+            font-size: 14px;
+        }
+        input:focus {
+            outline: none;
+            background: #f0f0f0;
+        }
+        .container {
+            max-height: 85vh;
+            overflow: auto;
+        }
+        .save-button {
+            margin: 0px 0px 10px 0px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            position: sticky;
+            left: 0;
+            z-index: 2;
+        }
+        .save-button:hover {
+            background-color: #45a049;
+        }
+        .status-message {
+            margin-left: 20px;
+            color: #666;
+        }
+        .controls {
+            position: sticky;
+            left: 0;
+            background: white;
+            padding: 0px 0;
+            z-index: 2;
+        }
+        .sheet-tabs {
+            display: flex;
+            margin-bottom: 20px;
+            gap: 10px;
+        }
+        .sheet-tab {
+            padding: 10px 20px;
+            background-color: #f2f2f2;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .sheet-tab.active {
+            background-color: #4CAF50;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <div style="font-size: 20px; font-weight: bold; margin-bottom: 10px;">Grid Table</div>
+        <div class="sheet-tabs">
+            <div class="sheet-tab active" onclick="switchSheet('inputs')">Inputs</div>
+            <div class="sheet-tab" onclick="switchSheet('outputs')">Outputs</div>
+            <div class="sheet-tab" onclick="switchSheet('outputs2')">Outputs 2</div>
+        </div>
+        <button class="save-button" onclick="saveAllCells()">Save All Changes</button>
+        <span id="statusMessage" class="status-message"></span>
+    </div>
+    <div class="container">
+        <table id="gridTable">
+            <thead id="tableHeader">
+            </thead>
+            <tbody id="tableBody">
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        let currentSheet = 'inputs';
+
+        // Load data from the database and create the table
+        async function loadDataAndCreateTable(sheet) {
+            try {
+                const response = await fetch(`/api/cells/${sheet}`);
+                if (!response.ok) {
+                    throw new Error('Failed to load data');
+                }
+                const data = await response.json();
+                const cells = data.cells;
+                const columnNames = data.columnOrder;
+                
+                // Get unique row names
+                const rowNames = [...new Set(cells.map(cell => cell.row))].sort((a, b) => parseInt(a) - parseInt(b));
+                
+                // Create a map of cell values for quick lookup
+                const cellMap = {};
+                cells.forEach(cell => {
+                    cellMap[`${cell.row}-${cell.column}`] = cell.value;
+                });
+                
+                // Create table header
+                const tableHeader = document.getElementById('tableHeader');
+                let headerRow = '<tr>';
+                columnNames.forEach(col => {
+                    headerRow += `<th>${col}</th>`;
+                });
+                headerRow += '</tr>';
+                tableHeader.innerHTML = headerRow;
+                
+                // Create table body
+                const tableBody = document.getElementById('tableBody');
+                tableBody.innerHTML = ''; // Clear existing rows
+                rowNames.forEach(rowName => {
+                    const tr = document.createElement('tr');
+                    
+                    columnNames.forEach(colName => {
+                        const value = cellMap[`${rowName}-${colName}`];
+                        tr.innerHTML += `
+                            <td>
+                                <input 
+                                    type="text" 
+                                    data-row="${rowName}" 
+                                    data-column="${colName}"
+                                    value="${value === null || value === undefined ? '' : value}"
+                                >
+                            </td>
+                        `;
+                    });
+                    tableBody.appendChild(tr);
+                });
+            } catch (error) {
+                console.error('Error loading data:', error);
+            }
+        }
+
+        // Switch between sheets
+        function switchSheet(sheet) {
+            currentSheet = sheet;
+            // Update active tab
+            document.querySelectorAll('.sheet-tab').forEach(tab => {
+                tab.classList.remove('active');
+                const onclickValue = tab.getAttribute('onclick');
+                if (onclickValue === `switchSheet('${sheet}')`) {
+                    tab.classList.add('active');
+                }
+            });
+            // Load new sheet data
+            loadDataAndCreateTable(sheet);
+        }
+
+        // Save all cells to the database
+        async function saveAllCells() {
+            const statusMessage = document.getElementById('statusMessage');
+            statusMessage.textContent = 'Saving...';
+            
+            try {
+                const inputs = document.querySelectorAll('input');
+                const updates = Array.from(inputs).map(input => ({
+                    row: input.dataset.row,
+                    column: input.dataset.column,
+                    value: input.value
+                }));
+
+                const response = await fetch(`/api/cells/${currentSheet}/save-all`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(updates)
+                });
+
+                if (!response.ok) {
+                    throw new Error('Failed to save data');
+                }
+
+                statusMessage.textContent = 'Saved successfully!';
+                setTimeout(() => {
+                    statusMessage.textContent = '';
+                }, 3000);
+            } catch (error) {
+                console.error('Error saving data:', error);
+                statusMessage.textContent = 'Error saving data!';
+            }
+        }
+
+        // Load data and create table when the page loads
+        document.addEventListener('DOMContentLoaded', () => loadDataAndCreateTable(currentSheet));
+    </script>
+</body>
+</html> 
